@@ -558,17 +558,6 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
-<<<<<<< HEAD
-    sock = socket_t::connect(host.c_str(), port);
-    if (sock == nullptr) {
-        GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
-    }
-    if (!negotiate_hello(sock)) {
-        GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
-=======
-    if (!rpc_transport_init()) {
-        return nullptr;
-    }
     // Retry the connection: an RPC worker may not be up yet at boot (e.g.
     // coming online right after a deploy).  Tune with GGML_RPC_RETRY (max
     // attempts, default 6) and GGML_RPC_RETRY_DELAY_MS (pause, default 2000).
@@ -595,7 +584,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s after %d attempts\n", endpoint.c_str(), max_attempts);
         return nullptr;
->>>>>>> d3539e111 (rpc: retry worker connection at init (GGML_RPC_RETRY))
+    }
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
@@ -921,6 +910,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
         };
+        auto dispatcher = get_dispatcher(buft_ctx->endpoint);
+
+        auto request = std::make_shared<rpc_msg_get_alloc_size_req>();
+        request->device = buft_ctx->device;
+        request->tensor = serialize_tensor(tensor);
 
         alloc_size_cache_key key = {};
         key.device = buft_ctx->device;
@@ -1015,6 +1009,20 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
     ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+}
+
+static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+    auto request = std::make_shared<rpc_msg_get_tensor_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->size = size;
+    ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+}
+
+static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_ctx->dispatcher->synchronize();
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
