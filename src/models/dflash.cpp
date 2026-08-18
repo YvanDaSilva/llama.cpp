@@ -15,6 +15,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
+    ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
+    hparams.f_final_logit_softcapping = 0.0f;
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,      hparams.f_final_logit_softcapping, false);
+    ml.get_key(LLM_KV_EMBEDDING_SCALE,              hparams.f_embedding_scale, false);
+
+    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,        hparams.dflash_block_size,       false);
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
@@ -273,7 +279,7 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
-llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     ggml_tensor * cur = build_inp_embd_enc();
 
     cur = build_lora_mm(model.fc, cur, model.fc_s);
@@ -421,27 +427,13 @@ static ggml_tensor * build_dflash2_conv(
 
     const int64_t block_size = n_tokens / n_blocks;
     ggml_context * ctx0 = g.ctx0;
-    // ggml_cont copies even when the tensor is already contiguous
-    if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
-        hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
-    }
-    if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
-        dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
-    }
+    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
-
-    ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
-    coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
-    coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
-
-    ggml_tensor * base_side = ggml_reshape_4d(ctx0,
-            ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
-            group_size, n_groups, kernel_size, 1);
-
-    ggml_tensor * weight_all = ggml_add(ctx0, coeff_all, base_side);
 
     ggml_tensor * result = nullptr;
     for (int64_t tap = 0; tap < kernel_size; ++tap) {
@@ -459,115 +451,26 @@ static ggml_tensor * build_dflash2_conv(
         }
         values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
-                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
-                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+        ggml_tensor * coeff = ggml_view_2d(ctx0, coeffs_side, n_groups, n_tokens,
+                coeffs_side->nb[2], tap * coeffs_side->nb[1]);
+        coeff = ggml_cont(ctx0, coeff);
+        coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
+        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
 
+        ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
+                tap * base->nb[1] + side * base->nb[2]);
+        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;
 }
 
-// DFlash2 selector: top-k candidates per block position plus the pairwise
-// transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
-    ggml_context * ctx0 = g.ctx0;
-    auto         & res  = g.res;
-
-    const auto & hparams = g.hparams;
-    const int64_t n_tokens = g.n_tokens;
-    const int64_t n_embd   = g.n_embd;
-
-    const int64_t top_k    = hparams.dflash_selector_top_k;
-    const int64_t rank     = hparams.dflash_selector_rank;
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
-    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
-    if (!tokens) {
-        return;
-    }
-
-    const int64_t tokens_per_block = n_tokens / n_blocks;
-    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
-    const int64_t row_used   = top_k + top_k * top_k;
-
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
-    ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
-
-    // Everything below indexes [.., tokens_per_block, n_blocks]: the block
-    // position varies fastest, sequences are the outer dimension.
-    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, candidates, top_k, tokens_per_block, n_blocks);
-    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary,      top_k, tokens_per_block, n_blocks);
-    ggml_tensor * gate_blk  = ggml_reshape_3d(ctx0, gate,       rank,  tokens_per_block, n_blocks);
-
-    // a position's score reads only the candidate sets at pos-1 and pos, so a run
-    // of positions has no internal dependency and scores in one batched matmul
-    auto score_run = [&](int64_t beg_pos, int64_t n_pos, ggml_tensor * pred_ids) {
-        ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks,
-                    cand_blk->nb[1], cand_blk->nb[2], beg_pos * cand_blk->nb[1]));
-        ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
-                    unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]));
-        ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
-                    gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]));
-
-        const int64_t n_pred = pred_ids->ne[0] / (n_pos * n_blocks);
-
-        ggml_tensor * successor = ggml_reshape_4d(ctx0,
-                ggml_get_rows(ctx0, model.dflash_selector_next, ggml_reshape_1d(ctx0, cand_run, top_k * n_pos * n_blocks)),
-                rank, top_k, n_pos, n_blocks);
-        ggml_tensor * predecessor = ggml_reshape_4d(ctx0,
-                ggml_get_rows(ctx0, model.dflash_selector_prev, pred_ids),
-                rank, n_pred, n_pos, n_blocks);
-
-        ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
-        ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
-        ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
-        if (n_pred == 1) {
-            score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
-        }
-        ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
-        score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
-
-        ggml_tensor * row = ggml_concat(ctx0,
-                ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
-                ggml_reshape_3d(ctx0, score, top_k * top_k, n_pos, n_blocks), 0);
-        return ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
-    };
-
-    ggml_tensor * packed = ggml_fill(ctx0,
-            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
-
-    if (block_size > 1) {
-        // Position 1 alone: its predecessor is the anchor token, one id per
-        // sequence rather than a candidate set.
-        ggml_tensor * anchor_ids = ggml_cont_1d(ctx0,
-                ggml_view_2d(ctx0, tokens, 1, n_blocks, tokens_per_block * tokens->nb[0], 0), n_blocks);
-        packed = ggml_concat(ctx0, packed, score_run(1, 1, anchor_ids), 1);
-    }
-    if (block_size > 2) {
-        ggml_tensor * prev_ids = ggml_reshape_1d(ctx0,
-                ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, block_size - 2, n_blocks,
-                        cand_blk->nb[1], cand_blk->nb[2], cand_blk->nb[1])),
-                top_k * (block_size - 2) * n_blocks);
-        packed = ggml_concat(ctx0, packed, score_run(2, block_size - 2, prev_ids), 1);
-    }
-
-    packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
-    g.cb(packed, "dflash2_lattice", -1);
-    res->t_h_nextn = packed;
-    ggml_build_forward_expand(g.gf, packed);
-}
-
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
-llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -688,6 +591,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inp_tokens = inp->tokens;
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    if (hparams.f_embedding_scale != 0.0f) {
+        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -726,6 +632,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * cur = use_iswa
             ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
             : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+
+        if (attn_dynamic) {
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+            cb(cur, "attn_conv_out", il);
+        }
 
         if (attn_dynamic) {
             cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
@@ -823,6 +734,98 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dflash_selector_hidden) {
         build_dflash2_selector(*this, model, inp_tokens);
     }
+}
+
+template <bool is_enc>
+void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
+    if constexpr (is_enc) {
+        return;
+    }
+
+    if (!model.dflash_selector_hidden || !res->t_logits) {
+        return;
+    }
+
+    const int64_t top_k    = hparams.dflash_selector_top_k;
+    const int64_t rank     = hparams.dflash_selector_rank;
+    const int64_t n_blocks = ubatch.n_seqs_unq;
+    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    ggml_tensor * tokens = res->get_inp_tokens();
+    if (!tokens) {
+        return;
+    }
+
+    const int64_t tokens_per_block = n_tokens / n_blocks;
+    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
+    ggml_tensor * candidates = ggml_top_k(ctx0, res->t_logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * unary = ggml_reshape_2d(ctx0,
+            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+
+    std::vector<ggml_tensor *> candidate_ids(block_size);
+    std::vector<ggml_tensor *> unary_logits(block_size);
+    for (int64_t pos = 1; pos < block_size; ++pos) {
+        candidate_ids[pos] = ggml_cont_2d(ctx0,
+                ggml_view_2d(ctx0, candidates, top_k, n_blocks,
+                    tokens_per_block * candidates->nb[1], pos * candidates->nb[1]),
+                top_k, n_blocks);
+        unary_logits[pos] = ggml_cont_2d(ctx0,
+                ggml_view_2d(ctx0, unary, top_k, n_blocks,
+                    tokens_per_block * unary->nb[1], pos * unary->nb[1]),
+                top_k, n_blocks);
+    }
+
+    ggml_tensor * hidden = build_lora_mm(model.dflash_selector_hidden, res->t_embd);
+
+    ggml_tensor * anchor_ids = ggml_view_2d(ctx0, tokens, 1, n_blocks,
+            tokens_per_block * tokens->nb[0], 0);
+    anchor_ids = ggml_cont_1d(ctx0, anchor_ids, n_blocks);
+
+    ggml_tensor * packed = ggml_fill(ctx0,
+            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
+
+    for (int64_t pos = 1; pos < block_size; ++pos) {
+        ggml_tensor * ids = candidate_ids[pos];
+        ggml_tensor * unary = unary_logits[pos];
+        ggml_tensor * successor = ggml_get_rows(ctx0, model.dflash_selector_next,
+                ggml_reshape_1d(ctx0, ids, top_k * n_blocks));
+        successor = ggml_reshape_3d(ctx0, successor, rank, top_k, n_blocks);
+
+        ggml_tensor * hidden_pos = ggml_cont(ctx0, ggml_view_2d(ctx0, hidden, rank, n_blocks,
+                tokens_per_block * hidden->nb[1], pos * hidden->nb[1]));
+        hidden_pos = ggml_reshape_3d(ctx0, hidden_pos, rank, 1, n_blocks);
+
+        ggml_tensor * predecessor;
+        if (pos == 1) {
+            predecessor = ggml_get_rows(ctx0, model.dflash_selector_prev, anchor_ids);
+            predecessor = ggml_reshape_3d(ctx0, predecessor, rank, 1, n_blocks);
+        } else {
+            predecessor = ggml_get_rows(ctx0, model.dflash_selector_prev,
+                    ggml_reshape_1d(ctx0, candidate_ids[pos - 1], top_k * n_blocks));
+            predecessor = ggml_reshape_3d(ctx0, predecessor, rank, top_k, n_blocks);
+        }
+
+        ggml_tensor * conditioned = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, hidden_pos, predecessor));
+        ggml_tensor * scores = ggml_mul_mat(ctx0, successor, conditioned);
+        if (pos == 1) {
+            scores = ggml_repeat_4d(ctx0, scores, top_k, top_k, n_blocks, 1);
+        }
+        ggml_tensor * unary_3d = ggml_reshape_3d(ctx0, unary, top_k, 1, n_blocks);
+        scores = ggml_add(ctx0, scores, ggml_repeat(ctx0, unary_3d, scores));
+
+        ggml_tensor * row = ggml_concat(ctx0,
+                ggml_cast(ctx0, ids, GGML_TYPE_F32),
+                ggml_reshape_2d(ctx0, scores, top_k * top_k, n_blocks), 0);
+        row = ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
+        row = ggml_reshape_3d(ctx0, row, n_embd, 1, n_blocks);
+        packed = ggml_concat(ctx0, packed, row, 1);
+    }
+
+    packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
+    cb(packed, "dflash2_lattice", -1);
+    res->t_h_nextn = packed;
+    ggml_build_forward_expand(gf, packed);
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
