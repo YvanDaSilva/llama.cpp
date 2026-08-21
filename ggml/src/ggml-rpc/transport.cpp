@@ -653,55 +653,86 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
+static void close_fd(sockfd_t fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
 socket_ptr socket_t::create_server(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (!is_valid_fd(sockfd)) {
-        return nullptr;
-    }
-    if (!set_reuse_addr(sockfd)) {
-        GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
-    }
-    if (inet_addr(host) == INADDR_NONE) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints = {};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
         GGML_LOG_ERROR("Invalid host address: %s\n", host);
         return nullptr;
     }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
 
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        return nullptr;
+    for (struct addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+        sockfd_t sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (!is_valid_fd(sockfd)) {
+            continue;
+        }
+        if (!set_reuse_addr(sockfd)) {
+            GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
+            close_fd(sockfd);
+            continue;
+        }
+        if (ai->ai_family == AF_INET6) {
+            // dual-stack: accept IPv4 connections on the IPv6 wildcard too
+            int off = 0;
+            setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        }
+        if (bind(sockfd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(sockfd, 1) == 0) {
+            freeaddrinfo(res);
+            return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+        }
+        close_fd(sockfd);
     }
-    if (listen(sockfd, 1) < 0) {
-        return nullptr;
-    }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    freeaddrinfo(res);
+    return nullptr;
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (!is_valid_fd(sockfd)) {
-        return nullptr;
-    }
-    if (!set_no_delay(sockfd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints = {};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
         return nullptr;
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
+
+    for (struct addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
+        sockfd_t sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (!is_valid_fd(sockfd)) {
+            continue;
+        }
+        if (!set_no_delay(sockfd)) {
+            GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+            close_fd(sockfd);
+            continue;
+        }
+        if (::connect(sockfd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            freeaddrinfo(res);
+            return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+        }
+        close_fd(sockfd);
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    freeaddrinfo(res);
+    return nullptr;
 }
 
 #ifdef _WIN32
