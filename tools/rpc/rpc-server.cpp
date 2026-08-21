@@ -313,7 +313,10 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-    std::string endpoint = params.host + ":" + std::to_string(params.port);
+    // bracket IPv6 hosts so the endpoint stays unambiguous: "[::]:50052"
+    std::string endpoint = (params.host.find(':') != std::string::npos)
+        ? "[" + params.host + "]:" + std::to_string(params.port)
+        : params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
