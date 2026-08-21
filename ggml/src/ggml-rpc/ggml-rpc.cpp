@@ -14,6 +14,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -556,12 +558,44 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
+<<<<<<< HEAD
     sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+=======
+    if (!rpc_transport_init()) {
+        return nullptr;
+    }
+    // Retry the connection: an RPC worker may not be up yet at boot (e.g.
+    // coming online right after a deploy).  Tune with GGML_RPC_RETRY (max
+    // attempts, default 6) and GGML_RPC_RETRY_DELAY_MS (pause, default 2000).
+    const char * retry_env = std::getenv("GGML_RPC_RETRY");
+    const char * delay_env = std::getenv("GGML_RPC_RETRY_DELAY_MS");
+    int max_attempts = retry_env ? atoi(retry_env) : 6;
+    int delay_ms     = delay_env ? atoi(delay_env) : 2000;
+    if (max_attempts < 1) {
+        max_attempts = 1;
+    }
+    std::shared_ptr<socket_t> sock = nullptr;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        sock = socket_t::connect(host.c_str(), port);
+        if (sock != nullptr && negotiate_hello(sock)) {
+            break;
+        }
+        sock = nullptr;
+        if (attempt < max_attempts) {
+            GGML_LOG_WARN("[rpc] connection to %s failed (attempt %d/%d), retrying in %d ms\n",
+                          endpoint.c_str(), attempt, max_attempts, delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+    }
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to %s after %d attempts\n", endpoint.c_str(), max_attempts);
+        return nullptr;
+>>>>>>> d3539e111 (rpc: retry worker connection at init (GGML_RPC_RETRY))
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
