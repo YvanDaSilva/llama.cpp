@@ -16,6 +16,8 @@
 #  include <netinet/tcp.h>
 #  include <netdb.h>
 #  include <unistd.h>
+#  include <fcntl.h>
+#  include <poll.h>
 #endif
 #include <cstdlib>
 #include <cstring>
