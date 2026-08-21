@@ -715,6 +715,12 @@ socket_ptr socket_t::connect(const char * host, int port) {
         return nullptr;
     }
 
+    // Per-attempt connect timeout: an unreachable peer (e.g. a firewalled or
+    // still-booting worker) must fail fast so the caller's retry loop can
+    // cycle, instead of blocking on the kernel SYN timeout (~2 min).
+    const char * timeout_env = std::getenv("GGML_RPC_CONNECT_TIMEOUT_MS");
+    const int connect_timeout_ms = timeout_env ? atoi(timeout_env) : 3000;
+
     for (struct addrinfo * ai = res; ai != nullptr; ai = ai->ai_next) {
         sockfd_t sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (!is_valid_fd(sockfd)) {
@@ -725,10 +731,34 @@ socket_ptr socket_t::connect(const char * host, int port) {
             close_fd(sockfd);
             continue;
         }
+#ifndef _WIN32
+        // non-blocking connect + poll(2) with timeout
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+        int rc = ::connect(sockfd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            struct pollfd pfd = { sockfd, POLLOUT, 0 };
+            int pr = poll(&pfd, 1, connect_timeout_ms);
+            if (pr > 0 && (pfd.revents & POLLOUT)) {
+                int so_err = 0;
+                socklen_t so_len = sizeof(so_err);
+                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
+                rc = (so_err == 0) ? 0 : -1;
+            } else {
+                rc = -1;
+            }
+        }
+        if (rc == 0) {
+            fcntl(sockfd, F_SETFL, flags);
+            freeaddrinfo(res);
+            return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+        }
+#else
         if (::connect(sockfd, ai->ai_addr, ai->ai_addrlen) == 0) {
             freeaddrinfo(res);
             return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
         }
+#endif
         close_fd(sockfd);
     }
     freeaddrinfo(res);
