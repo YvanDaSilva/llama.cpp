@@ -19,6 +19,7 @@ distributed RPC, Qwen3.8-27B hybrid + MTP/DFlash2/DSpark spec decoding).
 | **#27210** | spec: adaptive MTP draft depth (`draft-mtp-adaptive`) | Spec throughput; controller climbs from a floor depth |
 | **#27173** | speculative: draft perf + chain MTP steps in one graph + rollback bugfix | ~+10% t/s, deeper drafts; conflict with #27210 in speculative.cpp resolved (keep both) |
 | **#27342** | spec: DFlash2 support (block-diffusion sidecar) | The Qwen3.8 DFlash2 sidecar path |
+| **#18626** | rpc: implement event and async backend APIs (rgerganov, `rpc-async`) | Pipeline-parallel input processing — the upstream rework that supersedes #24675. Per-endpoint command queue + RPC events; the `RPC_CMD_GET_ALLOC_SIZE` response cache is what unlocks the pipeline overlap. Conflicts resolved: kept our boot-retry loop (H2), took the async dispatcher (H3/H4), union of the caps (events + mmap) |
 
 ## Our own patches (beyond the merged PRs)
 

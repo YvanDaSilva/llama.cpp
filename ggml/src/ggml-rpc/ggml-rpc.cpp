@@ -558,6 +558,9 @@ void rpc_dispatcher::start(const std::string & endpoint) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
+    if (!rpc_transport_init()) {
+        GGML_ABORT("RPC transport initialization failed\n");
+    }
     // Retry the connection: an RPC worker may not be up yet at boot (e.g.
     // coming online right after a deploy).  Tune with GGML_RPC_RETRY (max
     // attempts, default 6) and GGML_RPC_RETRY_DELAY_MS (pause, default 2000).
@@ -568,7 +571,6 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (max_attempts < 1) {
         max_attempts = 1;
     }
-    std::shared_ptr<socket_t> sock = nullptr;
     for (int attempt = 1; attempt <= max_attempts; ++attempt) {
         sock = socket_t::connect(host.c_str(), port);
         if (sock != nullptr && negotiate_hello(sock)) {
@@ -583,7 +585,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     }
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s after %d attempts\n", endpoint.c_str(), max_attempts);
-        return nullptr;
+        GGML_ABORT("RPC connection to %s failed\n", endpoint.c_str());
     }
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -735,11 +737,6 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    // Parallel model-loading workers can call set_tensor concurrently.
-    // Serialize complete set-tensor request/response transactions because
-    // RPC devices for the same endpoint may share one socket.
-    static std::mutex set_tensor_mutex;
-
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
@@ -757,15 +754,12 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         // Input format:
         // | rpc_tensor | offset (8 bytes) | data (size bytes) |
         const size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-
-        std::vector<uint8_t> input(input_size, 0);
-        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-
-        status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-
-        RPC_STATUS_ASSERT(status);
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+        memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
+        memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
         return;
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
