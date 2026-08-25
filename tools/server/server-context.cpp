@@ -1098,6 +1098,23 @@ private:
                 } catch (const std::exception & e) {
                     SRV_WRN("[spec] failed to measure %s memory: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
+                    if (has_draft && !tgt_devices.empty()) {
+                        // fallback reserve: the dflash/dspark measure can't create a
+                        // standalone context (the arch requires ctx_other), so reserve
+                        // the draft file size + margin on the main device -- otherwise
+                        // the fit fills the main card and the pinned draft OOMs
+                        const size_t main_idx = std::min<size_t>((size_t) params.main_gpu, tgt_devices.size() - 1);
+                        size_t reserve = 0;
+                        std::error_code ec;
+                        const auto sz = std::filesystem::file_size(params.speculative.draft.mparams.path, ec);
+                        if (!ec) {
+                            reserve = sz;
+                        }
+                        reserve += 1024ULL * 1024 * 1024; // +1 GiB margin for the draft ctx/compute
+                        params_base.fit_params_target[main_idx] += reserve;
+                        SRV_WRN("[spec] fallback reserve %.2f GiB on device %s for the draft\n",
+                                reserve / (1024.0 * 1024.0 * 1024.0), ggml_backend_dev_name(tgt_devices[main_idx]));
+                    }
                 }
             }
         }
