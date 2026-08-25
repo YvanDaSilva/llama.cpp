@@ -2786,6 +2786,15 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // pin the external draft model to the main device: the draft is a small
+        // accelerator and splitting it across RPC workers is broken upstream
+        // (the DFlash2/Eagle3 PRs are CUDA-first, never exercised over RPC)
+        // -- the draft stays local, only the target model is split
+        if (!cparams.devices.empty()) {
+            const size_t main_idx = std::min<size_t>((size_t) params.main_gpu, cparams.devices.size() - 1);
+            cparams.devices = { cparams.devices[main_idx] };
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
