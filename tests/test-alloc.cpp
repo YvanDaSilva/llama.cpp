@@ -695,9 +695,5 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
-<<<<<<< HEAD
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
-=======
-    run(    run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
-
     run("test_view_init_after_max_size_split", test_view_init_after_max_size_split);
