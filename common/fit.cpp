@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cassert>
+#include <filesystem>
+#include <system_error>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -222,9 +224,18 @@ static void common_params_fit_impl(
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
-                // the extra model is optional, fit the main model alone rather than giving up
-                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                // fork (testing-rebase): the dflash/dspark extra-model measure can't create
+                // a standalone context (the arch requires ctx_other), so reserve the draft
+                // file size + margin on the main device instead of fitting alone -- otherwise
+                // the fit fills the main card and the pinned draft OOMs.
+                LOG_WRN("%s: failed to measure the memory of the extra model, reserving its file size on the main device: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
+                std::error_code ec;
+                const auto sz = std::filesystem::file_size(extra->path_model, ec);
+                if (!ec && sz > 0) {
+                    const size_t reserve = (size_t) sz + 1024ULL * 1024 * 1024; // +1 GiB margin for the draft ctx/compute
+                    dmds_extra[0].mb.model += reserve;
+                }
                 n_ctx_extra = cparams->n_ctx;
                 return;
             }
