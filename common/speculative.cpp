@@ -926,6 +926,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
 
+    std::vector<float> features_buf;
+
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
@@ -1172,10 +1174,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
+                int32_t rc2 = llama_encode(ctx_dft, enc_batch);
+                if (rc2 != 0) {
+                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc2=%d (n_tokens=%d, offset=%d)\n",
+                            __func__, rc2, (int) n_chunk, (int) offset);
                     return false;
                 }
 
