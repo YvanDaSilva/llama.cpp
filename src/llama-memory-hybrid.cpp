@@ -29,9 +29,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr,
-                 uint32_t   n_kv_sink,
-                 uint32_t   n_kv_recent) :
+    const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,

@@ -39,9 +39,7 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr,
-                 uint32_t   n_kv_sink   = 0,
-                 uint32_t   n_kv_recent = 0);
+    const layer_filter_cb & filter_recr = nullptr);
 
     ~llama_memory_hybrid() = default;
 
