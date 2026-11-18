@@ -201,6 +201,8 @@ int main(int argc, char ** argv) {
                 /* .result     = */ &draft, // output
                 /* .dists      = */ &dists,
                 /* .temperature = */ params.sampling.temp,
+                /* .result_q   = */ nullptr,
+                /* .temp       = */ params.sampling.temp,
                 /* .seed       = */ common_sampler_get_seed(smpl.get()),
             };
             common_speculative_draft(spec);
