@@ -309,46 +309,6 @@ ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const 
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    const int64_t block_size = n_tokens / n_blocks;
-    ggml_context * ctx0 = g.ctx0;
-    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
-    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
-    ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
-    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
-    ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
-    ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
-            coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
-
-    ggml_tensor * result = nullptr;
-    for (int64_t tap = 0; tap < kernel_size; ++tap) {
-        ggml_tensor * values = blocks;
-        if (tap > 0) {
-            ggml_tensor * zeros = ggml_fill(ctx0,
-                    ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, std::min(tap, block_size), n_blocks), 0.0f);
-            if (tap < block_size) {
-                ggml_tensor * previous = ggml_view_3d(ctx0, blocks, hidden_size, block_size - tap, n_blocks,
-                        blocks->nb[1], blocks->nb[2], 0);
-                values = ggml_concat(ctx0, zeros, previous, 1);
-            } else {
-                values = zeros;
-            }
-        }
-        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
-
-        ggml_tensor * coeff = ggml_view_2d(ctx0, coeffs_side, n_groups, n_tokens,
-                coeffs_side->nb[2], tap * coeffs_side->nb[1]);
-        coeff = ggml_cont(ctx0, coeff);
-        coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
-        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
-
-        ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
-                tap * base->nb[1] + side * base->nb[2]);
-        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
-        ggml_tensor * term = ggml_mul(ctx0, weight, values);
-        result = result ? ggml_add(ctx0, result, term) : term;
-    }
-    return result;
-}
 
     ggml_tensor * inp_target = build_inp_target_features(g, *inp, n_embd_inp);
     g.cb(inp_target, "inp_target_features", -1);

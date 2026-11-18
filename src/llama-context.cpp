@@ -935,7 +935,7 @@ void llama_context::sched_reserve() {
         const char * env = getenv("LLAMA_SCHED_POOL");
         return env != nullptr ? atoi(env) : 0;
     }();
-    if (sched_pool_env > 0 && !model.hparams.no_alloc) {
+    if (sched_pool_env > 0 && !model.no_alloc()) {
         sched_pool_max = std::min(sched_pool_env, 16);
     }
 
@@ -1885,7 +1885,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if ((int) sched_pool.size() < sched_pool_max) {
                 sched_pool.emplace_back();
                 slot = &sched_pool.back();
-                const size_t max_nodes = graph_max_nodes(ubatch.n_tokens);
+                const size_t max_nodes = graph_max_nodes();
                 slot->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                         backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
                 slot->gf_res.reset(new llm_graph_result(max_nodes));

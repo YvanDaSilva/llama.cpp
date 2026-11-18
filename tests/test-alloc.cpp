@@ -675,6 +675,7 @@ static bool graph_reuses_allocation(bool add_alloc_dep) {
 static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(graph_reuses_allocation(false));
     GGML_ASSERT(!graph_reuses_allocation(true));
+}
 
 // Parent nbytes > max_size leaves cur_buf_size > max_size. A following view
 // then triggers a split with this_size == 0, so the view-only residual range

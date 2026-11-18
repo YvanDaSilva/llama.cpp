@@ -2196,6 +2196,8 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         }
     }
     return true;
+}
+
 static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
     return t->buffer != NULL &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -2484,7 +2486,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             ggml_backend_sched_copy_input(sched, split, input);
             }
-        }
 
         if (!sched->callback_eval) {
             // Cross-stream sync for a lookahead/inline-prefetched weight: wait until the
