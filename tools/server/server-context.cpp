@@ -1330,12 +1330,13 @@ private:
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
+                uint32_t hp_ngl_skip = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
                 try {
                     auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                        params_dft.model.get_paths(), &mparams_dft, &cparams_dft,
+                        devs, hp_ngl, hp_ngl_skip, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;

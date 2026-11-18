@@ -319,9 +319,15 @@ static void common_params_fit_impl(
                 LOG_WRN("%s: failed to measure the memory of the extra model, reserving its file size on the main device: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 std::error_code ec;
-                const auto sz = std::filesystem::file_size(extra->path_model, ec);
-                if (!ec && sz > 0) {
-                    const size_t reserve = (size_t) sz + 1024ULL * 1024 * 1024; // +1 GiB margin for the draft ctx/compute
+                size_t sz = 0;
+                for (const auto & p : extra->paths_model) {
+                    const auto sz_p = std::filesystem::file_size(p, ec);
+                    if (!ec) {
+                        sz += sz_p;
+                    }
+                }
+                if (sz > 0) {
+                    const size_t reserve = sz + 1024ULL * 1024 * 1024; // +1 GiB margin for the draft ctx/compute
                     dmds_extra[0].mb.model += reserve;
                 }
                 n_ctx_extra = cparams->n_ctx;
