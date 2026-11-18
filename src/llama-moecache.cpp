@@ -20,7 +20,7 @@
 namespace {
 
 struct layer_state {
-    llama_moe_cache_layer pub;
+    llama_host_moe_cache_layer pub;
 
     // LRU bookkeeping (host side; the tables mirror expert_slot)
     std::vector<int32_t>  slot_expert;   // slot -> expert id, -1 when empty
@@ -136,7 +136,7 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
     ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
 }
 
-void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
+void set_table_entry(llama_host_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
     const int32_t v = slot_or_dummy;
     ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
@@ -144,7 +144,7 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
 
 } // namespace
 
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+void llama_host_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
         return;
@@ -319,7 +319,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
     }();
 }
 
-const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps) {
+const llama_host_moe_cache_layer * llama_host_moe_cache_lookup(const ggml_tensor * up_exps) {
     if (!g_cache) {
         return nullptr;
     }
@@ -330,7 +330,7 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
     return &g_cache->layers[it->second].pub;
 }
 
-void llama_moe_cache_step() {
+void llama_host_moe_cache_step() {
     moe_cache * mc = g_cache;
     if (!mc) {
         return;

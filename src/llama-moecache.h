@@ -19,7 +19,7 @@
 //  - the two down-projection outputs are summed; uncached ids contribute 0
 //    through the cache chain (zero slot) and cached ids contribute 0 through
 //    the CPU chain (skip), so the result is exact.
-//  - llama_moe_cache_step(), called at the end of llama_context::decode(),
+//  - llama_host_moe_cache_step(), called at the end of llama_context::decode(),
 //    performs throttled LRU updates: at most LLAMA_MOE_CACHE_INSERTS expert
 //    uploads per layer per step via ggml_backend_tensor_set.
 //
@@ -30,7 +30,7 @@
 struct llama_model;
 struct ggml_tensor;
 
-struct llama_moe_cache_layer {
+struct llama_host_moe_cache_layer {
     int il = -1;
 
     int32_t n_slots = 0;
@@ -52,10 +52,10 @@ struct llama_moe_cache_layer {
 
 // build the cache for every host-resident expert layer of the model.
 // Safe to call more than once; only the first call does work.
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
+void llama_host_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
 
 // nullptr when the cache is disabled or this tensor has no cached layer
-const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
+const llama_host_moe_cache_layer * llama_host_moe_cache_lookup(const ggml_tensor * up_exps);
 
 // apply throttled LRU updates; call between graph executions only
-void llama_moe_cache_step();
+void llama_host_moe_cache_step();
