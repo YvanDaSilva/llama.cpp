@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "../src/llama-ext.h"
 #include "speculative-adaptive.h"
 
 #include <algorithm>
@@ -1001,8 +1002,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
-
-    std::vector<float> features_buf;
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -2395,9 +2394,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // dp.n_max caps the round so the draft fits the remaining context
                 const int n_chain = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
 
-                // deferred rows at or past n_past hold candidates the verify
-                // rejected; the committed prefix ends at n_past - 1. Drop them.
-                drop_deferred_from(seq_one, dp.n_past);
+                // deferred rows at or past pos0 hold candidates the verify
+                // rejected; the committed prefix ends at pos0 - 1. Drop them.
+                drop_deferred_from(seq_one, dp.pos0);
 
                 // rows of other sequences cannot join a single-sequence chain
                 // batch; decode all remaining rows standalone in that case
@@ -2425,7 +2424,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // only the first chain row carries an embedding; the rest chain in-graph
                 const std::vector<float> row_zero(n_embd, 0.0f);
                 for (int j = 0; j < n_chain; ++j) {
-                    const int32_t idx = batch.add(j == 0 ? dp.id_last : 0, dp.n_past + j, { seq_one }, true);
+                    const int32_t idx = batch.add(j == 0 ? dp.id_last : 0, dp.pos0 + j, { seq_one }, true);
                     if (j == 0) {
                         batch.set_embd(idx, { pending_h[seq_one].data(), 1, (size_t) n_embd });
                     } else {
@@ -2514,9 +2513,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result_q) {
                 spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
             }
-
-            const int32_t idx = batch.add(dp.id_last, dp.n_past, { seq_id }, true);
-            batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
             // a reset reseeds the chain, which breaks probabilistic drafting
             if (!dp.result_q) {
