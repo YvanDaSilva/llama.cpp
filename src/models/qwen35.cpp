@@ -578,8 +578,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
 
         // per-step causal masks: row j of the stock kq mask (the mask builder pads
         // masks to exactly n_tokens rows, so plain row views work)
-        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-        const int64_t n_kv = kq_mask->ne[0];
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
+        const int64_t n_kv = inp_attn->self_attn_mask.n_kv;
 
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
@@ -633,6 +633,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
                     (size_t) n_tokens*inp_pos->nb[0], (size_t) row0*inp_pos->nb[0]));
             pos_b = ggml_reshape_1d(ctx0, pos_b, 4*width);
 
+            // ggml_rope_multi takes a mutable int[4]; hparams.rope_sections is const here
+            int sections[4] = {
+                hparams.rope_sections[0], hparams.rope_sections[1],
+                hparams.rope_sections[2], hparams.rope_sections[3] };
+
             Q_b = ggml_rope_multi(ctx0, Q_b, pos_b, nullptr,
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -655,7 +660,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
-            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale_c, il);
+            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, /*kv_rows*/ nullptr, nullptr, nullptr, 0, kq_scale_c, il);
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
