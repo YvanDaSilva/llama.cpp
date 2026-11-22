@@ -302,6 +302,9 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
+    // sparse proposal distributions per draft token; the DFlash2 selector drafter fills these
+    std::vector<common_speculative_token_dist> spec_dists;
+
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
@@ -449,6 +452,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1237,7 +1241,10 @@ private:
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
+                              std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1316,6 +1323,85 @@ private:
         }
 
         // note: the draft / MTP context is fitted together with the target model, see common_fit_extra_model
+
+        // optionally reserve VRAM for the draft / MTP context before fitting the target model
+        if (params_base.fit_params) {
+            if (has_spec) {
+                // MTP draft context lives on the target model, only context+compute are new
+                bool measure_model_bytes = has_draft;
+
+                common_params params_dft = common_base_params_to_speculative(params_base);
+
+                auto mparams_dft = common_model_params_to_llama(params_dft);
+                auto cparams_dft = common_context_params_to_llama(params_dft);
+                if (spec_mtp) {
+                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                }
+                cparams_dft.n_rs_seq = 0;
+
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t hp_ngl = 0;
+                uint32_t hp_ngl_skip = 0;
+                uint32_t hp_nct = 0;
+                uint32_t hp_nex = 0;
+                try {
+                    auto dmd = common_get_device_memory_data(
+                        params_dft.model.get_paths(), &mparams_dft, &cparams_dft,
+                        devs, hp_ngl, hp_ngl_skip, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+
+                    GGML_ASSERT(!params_base.fit_params_target.empty());
+                    size_t total = 0;
+
+                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+
+                    if (tgt_devices.empty()) {
+                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                           tgt_devices.push_back(ggml_backend_dev_get(i));
+                        }
+                    }
+
+                    for (size_t j = 0; j < devs.size(); ++j) {
+                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
+                        total += bytes;
+                        for (size_t i = 0; i < tgt_devices.size(); i++) {
+                            if (tgt_devices[i] == devs[j]) {
+                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                                params_base.fit_params_target[i] += bytes;
+                                break;
+                            }
+                        }
+                    }
+                    SRV_TRC("[spec] estimated memory usage of %s is %.2f MiB\n",
+                            has_draft ? "draft model" : "MTP context",
+                            total / (1024.0 * 1024.0));
+                } catch (const std::exception & e) {
+                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                            has_draft ? "draft model" : "MTP context", e.what());
+                    if (has_draft) {
+                        // fallback reserve: the dflash/dspark measure can't create a
+                        // standalone context (the arch requires ctx_other), so reserve
+                        // the draft file size + margin on the main device -- otherwise
+                        // the fit fills the main card and the pinned draft OOMs.
+                        // (tgt_devices is try-scoped; params.devices can be empty in
+                        // the auto-device case, so size from fit_params_target)
+                        size_t reserve = 0;
+                        std::error_code ec;
+                        const auto sz = std::filesystem::file_size(params.speculative.draft.mparams.path, ec);
+                        if (!ec) {
+                            reserve = sz;
+                        }
+                        reserve += 1024ULL * 1024 * 1024; // +1 GiB margin for the draft ctx/compute
+                        if (!params_base.fit_params_target.empty()) {
+                            const size_t main_idx = std::min<size_t>((size_t) params.main_gpu, params_base.fit_params_target.size() - 1);
+                            params_base.fit_params_target[main_idx] += reserve;
+                            SRV_WRN("[spec] fallback reserve %.2f GiB on device %s for the draft\n",
+                                    reserve / (1024.0 * 1024.0 * 1024.0), ggml_backend_dev_name(ggml_backend_dev_get(main_idx)));
+                        }
+                    }
+                }
+            }
+        }
 
         // attach a progress callback
         {
@@ -3878,9 +3964,11 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .dists    = */ &slot.spec_dists,
+                            /* .temperature = */ slot.task->params.sampling.temp,
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
                         drafting.push_back(&slot);
@@ -4906,9 +4994,15 @@ private:
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
 
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+                // maximal coupling: only the drafters that fill sparse proposal distributions
+                const bool use_dists = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                    !slot.spec_dists.empty() && slot.spec_dists.size() == slot.spec_draft.size();
 
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
@@ -4918,6 +5012,8 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                } else if (use_dists) {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_dists);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
@@ -4943,6 +5039,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4970,6 +5067,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const auto ids = std::move(slot.spec_draft);

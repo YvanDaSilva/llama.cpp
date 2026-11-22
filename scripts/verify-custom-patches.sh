@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Check that the fork patches survived a resync with upstream/master.
+#
+# Every line below is a grep count taken on the t3-full tip e93db8b54, before
+# the merge. A lower count means a conflict resolution dropped part of a patch.
+# A higher count means our lines merged with upstream code, so read that file.
+# Counts marked check_min follow the build log's "24>=20" convention: upstream
+# may add its own text, so only a decrease is a failure.
+#
+# usage: scripts/verify-custom-patches.sh
+
+set -u
+
+total=0
+bad=()
+
+check() {
+    _check 0 "$@"
+}
+
+# fails only when fewer matches remain: upstream may add its own text
+check_min() {
+    _check 1 "$@"
+}
+
+_check() {
+    local min_only=$1
+    shift
+    local file=$1
+    local regex=$2
+    local want=$3
+    local label=$4
+
+    total=$((total + 1))
+
+    if [[ ! -f $file ]]; then
+        printf 'FAIL  %-46s missing file %s\n' "$label" "$file"
+        bad+=("$label: file $file does not exist")
+        return
+    fi
+
+    local got
+    got=$(grep -cE -- "$regex" "$file")
+
+    local ok=0
+    if [[ $min_only -eq 1 ]]; then
+        [[ $got -ge $want ]] && ok=1
+    else
+        [[ $got -eq $want ]] && ok=1
+    fi
+
+    if [[ $ok -eq 1 ]]; then
+        printf 'ok    %-46s %-34s %s\n' "$label" "$file" "$got"
+    else
+        local want_str=$want
+        if [[ $min_only -eq 1 ]]; then
+            want_str="$want+"
+        fi
+        printf 'FAIL  %-46s %-34s want %s, got %s  (pattern: %s)\n' "$label" "$file" "$want_str" "$got" "$regex"
+        bad+=("$label: $file has $got match(es) of '$regex', expected $want_str")
+    fi
+}
+
+# build files
+check src/CMakeLists.txt 'llama-rollback-telescope\.cpp' 1 'telescope engine in libllama'
+check src/CMakeLists.txt 'llama-moecache\.cpp' 1 'expert cache in libllama'
+check tests/CMakeLists.txt 'test-speculative-adaptive\.cpp' 1 'adaptive MTP test built'
+
+# ggml rpc
+check ggml/src/ggml-rpc/transport.cpp 'getaddrinfo' 2 'IPv4+IPv6 transport'
+check ggml/src/ggml-rpc/transport.cpp 'IPV6_V6ONLY' 1 'dual-stack server socket'
+check ggml/src/ggml-rpc/transport.cpp 'GGML_RPC_CONNECT_TIMEOUT_MS' 1 'per-attempt connect timeout'
+check ggml/src/ggml-rpc/ggml-rpc.cpp 'GGML_RPC_RETRY' 4 'worker boot retry'
+check ggml/src/ggml-rpc/ggml-rpc.cpp 'RPC_CMD_GET_ALLOC_SIZE' 4 'alloc size response cache (upstream added a call site)'
+check ggml/src/ggml-rpc/ggml-rpc.cpp 'malformed (SET|GET)_ROWS' 2 'graph bounds validation'
+check tools/rpc/rpc-server.cpp 'host\.find' 1 'bracketed IPv6 endpoint'
+check src/llama-model-loader.cpp 'ggml_rpc_load_threads' 2 'parallel cache hashing'
+check src/llama-model-loader.cpp 'GGML_RPC_LOAD_THREADS' 2 'RPC preload thread count env'
+check src/llama-model-loader.cpp 'rpc_preloaded' 4 'RPC preload skip set'
+
+# ggml vulkan
+check ggml/src/ggml-vulkan/ggml-vulkan.cpp 'is_k_quant' 9 'AMD k-quant gate'
+check ggml/src/ggml-vulkan/ggml-vulkan.cpp 'k >= 4096' 1 'k-quant k threshold'
+check ggml/src/ggml-vulkan/ggml-vulkan.cpp 'MMVQ_MAX_DECODE_LIKE_N' 2 'spec step counts as decode'
+
+# ggml alloc / backend / cuda
+check ggml/src/ggml-alloc.c 'max_size' 12 'view init after max_size split (upstream alloc rewrite)'
+check ggml/src/ggml-alloc.c 'ggml_backend_view_init' 1 'view init in the plan path (superseded by upstream)'
+check tests/test-alloc.cpp 'test_view_init_after_max_size_split' 2 'max_size split regression test'
+check ggml/include/ggml-backend.h 'prefetch_experts_slots' 1 'expert prefetch API'
+check ggml/src/ggml-backend.cpp 'prefetch_experts_slots' 3 'expert prefetch impl'
+check ggml/src/ggml-backend-meta.cpp 'fingerprint' 5 'meta plan cache'
+check ggml/src/ggml-cuda/allreduce.cu 'ggml_cuda_ar_kernel_slot' 4 'chunked allreduce'
+
+# src
+check src/llama-ext.h 'llama_graph_reserve' 2 'graph reserve API'
+check src/llama-context.cpp 'LLAMA_SCHED_POOL|LLAMA_META_MIRROR_OUTPUT' 4 'sched pool + mirrored output'
+check src/llama-model.cpp 'LLAMA_META_MIRROR_OUTPUT' 2 'mirrored output head'
+check src/llama-context.cpp 'const_cast' 2 '-Wcast-qual fix'
+check src/models/dflash.cpp 'DFLASH_SELECTOR' 2 'DFlash2 selector use sites'
+check src/models/dflash2.cpp 'DFLASH_SELECTOR' 3 'DFlash2 selector tensors created'
+check src/models/qwen35.cpp 'build_attn_mha' 1 'qwen35 MTP graph'
+check src/models/delta-net-base.cpp 'snapshot' 3 'conv-state snapshot fix (bound moved into upstream helper)'
+check src/llama-moecache.cpp 'llama_host_moe_cache' 5 'expert cache engine (renamed to coexist with upstream llama_moe_cache)'
+check src/llama-rollback-telescope.cpp 'telescope' 11 'telescope engine'
+check src/llama-model-loader.cpp 'expert|EXPERT' 7 'expert cache load hooks'
+
+# common
+check common/speculative.cpp 'mparams\.devices' 4 'draft device pin (params.devices repointed)'
+check common/speculative.cpp 'ggml_backend_dev_t pinned\[2\]' 1 'draft device pin buffer'
+check common/speculative.cpp 'no_kv_offload = false' 1 'draft kv cache placement'
+check common/speculative.cpp 'LLAMA_SPEC_CHAIN' 3 'chained MTP draft'
+check common/speculative.cpp 'common_speculative_adaptive' 3 'adaptive draft depth'
+check common/speculative-adaptive.h 'common_speculative_adaptive' 1 'adaptive controller'
+check common/common.h 'COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE' 2 'adaptive type'
+check common/common.h 'prefetch_experts_slots' 1 'expert prefetch param'
+check common/arg.cpp 'prefetch-experts-slots' 1 'expert prefetch arg'
+check common/fit.cpp 'dmds_extra\[0\]\.mb\.model' 1 'fit draft reserve'
+check tests/test-arg-parser.cpp 'no_kv_offload' 2 'draft kv placement test'
+
+# tools/server
+check_min tools/server/server-context.cpp 'reserve' 24 'draft reserve (>=, upstream adds its own)'
+check tools/server/server-context.cpp 'fallback reserve' 2 'draft reserve scope'
+check tools/server/server-context.cpp 'fit_params_target\[main_idx\]' 1 'reserve on main device'
+check tools/server/server-context.cpp 'SLOT_CKPT_MAGIC' 3 'slot checkpoints'
+check_min tools/server/tests/unit/test_slot_save.py 'checkpoint' 2 'slot checkpoint test (upstream test is a superset)'
+
+# tests
+check tests/test-speculative-adaptive.cpp 'adaptive' 9 'adaptive draft test'
+check tests/test_telescope.cpp 'telescope' 10 'telescope test'
+
+# reverted on purpose (ac8c1c538): must not come back
+check src/llama-kv-cache.h 'llama_kv_cache_evict_stats' 0 'kv eviction telemetry stays reverted'
+
+if [[ ${#bad[@]} -gt 0 ]]; then
+    printf '\n%d of %d custom markers FAILED:\n' "${#bad[@]}" "$total"
+    for m in "${bad[@]}"; do
+        printf '  - %s\n' "$m"
+    done
+    printf '\nDo not commit until every failure is explained.\n'
+    exit 1
+fi
+
+printf '\nall %d custom markers present\n' "$total"

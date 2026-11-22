@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "speculative.h"
 
 #include "ggml.h"
 
@@ -738,9 +739,6 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
-// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
-// Preserves the target distribution exactly, and accepts more often than matching does when the
-// draft samples instead of taking its argmax.
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
@@ -847,6 +845,79 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     return result;
 }
 
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(dists.size() == draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        // Residual sampling needs the target distribution after every constraint.
+        const llama_token fallback = common_sampler_sample(gsmpl, ctx, idxs[i], true);
+        const auto & q = dists[i];
+        GGML_ASSERT(q.ids.size() == q.probs.size());
+
+        std::unordered_map<llama_token, float> q_probs;
+        q_probs.reserve(q.ids.size());
+        for (size_t j = 0; j < q.ids.size(); ++j) {
+            q_probs[q.ids[j]] += q.probs[j];
+        }
+        const auto q_prob = [&](llama_token id) {
+            const auto it = q_probs.find(id);
+            return it == q_probs.end() ? 0.0f : it->second;
+        };
+
+        auto * p = common_sampler_get_candidates(gsmpl, false);
+        float p_draft = 0.0f;
+        const float q_draft = q_prob(draft[i]);
+        for (size_t j = 0; j < p->size; ++j) {
+            if (p->data[j].id == draft[i]) {
+                p_draft = p->data[j].p;
+                break;
+            }
+        }
+
+        if (q_draft > 0.0f && uniform(gsmpl->rng) * q_draft <= p_draft) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        std::vector<float> residual(p->size);
+        float residual_sum = 0.0f;
+        for (size_t j = 0; j < p->size; ++j) {
+            residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
+            residual_sum += residual[j];
+        }
+
+        llama_token id = fallback;
+        if (residual_sum > 0.0f) {
+            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
+            id = p->data[sample(gsmpl->rng)].id;
+        }
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
@@ -854,6 +925,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, dists, grammar_first);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

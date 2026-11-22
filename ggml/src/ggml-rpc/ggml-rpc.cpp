@@ -18,6 +18,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -460,6 +462,20 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
+    // bracketed IPv6 form: "[fd1b::1]:50052"
+    if (!endpoint.empty() && endpoint[0] == '[') {
+        size_t close = endpoint.find(']');
+        if (close == std::string::npos || close + 1 >= endpoint.size() || endpoint[close + 1] != ':') {
+            return false;
+        }
+        host = endpoint.substr(1, close - 1);
+        try {
+            port = std::stoi(endpoint.substr(close + 2));
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
     size_t pos = endpoint.find(':');
     if (pos == std::string::npos) {
         return false;
@@ -782,13 +798,30 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
         return false;
     }
 
-    sock = socket_t::connect(host.c_str(), port);
-    if (sock == nullptr) {
-        LOG_ERROR("Failed to connect to %s\n", endpoint.c_str());
-        return false;
+    // Retry the connection: an RPC worker may not be up yet at boot (e.g.
+    // coming online right after a deploy).  Tune with GGML_RPC_RETRY (max
+    // attempts, default 6) and GGML_RPC_RETRY_DELAY_MS (pause, default 2000).
+    const char * retry_env = std::getenv("GGML_RPC_RETRY");
+    const char * delay_env = std::getenv("GGML_RPC_RETRY_DELAY_MS");
+    int max_attempts = retry_env ? atoi(retry_env) : 6;
+    int delay_ms     = delay_env ? atoi(delay_env) : 2000;
+    if (max_attempts < 1) {
+        max_attempts = 1;
     }
-    if (!negotiate_hello(sock, flags)) {
-        LOG_ERROR("RPC handshake failed for %s\n", endpoint.c_str());
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        sock = socket_t::connect(host.c_str(), port);
+        if (sock != nullptr && negotiate_hello(sock, flags)) {
+            break;
+        }
+        sock = nullptr;
+        if (attempt < max_attempts) {
+            GGML_LOG_WARN("[rpc] connection to %s failed (attempt %d/%d), retrying in %d ms\n",
+                          endpoint.c_str(), attempt, max_attempts, delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+    }
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to %s after %d attempts\n", endpoint.c_str(), max_attempts);
         return false;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1194,6 +1227,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
                 return std::max<size_t>(it->second, min_size);
             }
         }
+        auto dispatcher = get_dispatcher(buft_ctx->endpoint);
 
         rpc_msg_get_alloc_size_req request = {};
         request.device = buft_ctx->device;
@@ -1205,7 +1239,6 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         }
 
         LOG_DBG2("[%s] cache miss: %s, querying server\n", __func__, rpc_log_format_tensor(tensor).c_str());
-        auto dispatcher = get_dispatcher(buft_ctx->endpoint);
         if (dispatcher == nullptr) {
             return min_size;
         }
@@ -2176,6 +2209,26 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         graph->use_counts[hash_pos] = tensors[it->second].use_count;
         LOG_DBG3("[%s] node %u: id=%" PRIu64 ", %s\n", __func__, i, id, rpc_log_format_tensor(node).c_str());
     }
+
+    // PATCH: Validate graph nodes to prevent OOB writes (Issue #26912 and #26825)
+    for (uint32_t i = 0; i < n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+
+        if (node != nullptr && node->op == GGML_OP_SET_ROWS && node->src[0] != nullptr) {
+            if (node->ne[2] != node->src[0]->ne[2] || node->ne[3] != node->src[0]->ne[3]) {
+                GGML_LOG_ERROR("[%s] malformed SET_ROWS graph detected (dimension mismatch)\n", __func__);
+                return false;
+            }
+        }
+
+        if (node != nullptr && node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr && node->src[1] != nullptr) {
+            if (node->src[0]->ne[2] != node->src[1]->ne[1]) {
+                GGML_LOG_ERROR("[%s] malformed GET_ROWS graph detected (dimension mismatch)\n", __func__);
+                return false;
+            }
+        }
+    }
+
     const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
 
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);

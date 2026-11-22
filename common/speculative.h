@@ -5,6 +5,11 @@
 
 struct common_speculative;
 
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -72,6 +77,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional sparse proposal distributions, one per draft token
+    std::vector<common_speculative_token_dist> * dists = nullptr;
+
+    float temperature = 0.0f;
 
     // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;

@@ -357,6 +357,11 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
+llama_build_and_test(test-speculative-adaptive.cpp)
+
+# fork: forward-telescoping rollback engine, compiled against its own impl
+llama_build(test_telescope.cpp ${PROJECT_SOURCE_DIR}/src/llama-rollback-telescope.cpp)
+target_include_directories(test_telescope PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

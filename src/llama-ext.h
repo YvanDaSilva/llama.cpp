@@ -125,6 +125,15 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+// Run the DECODER_MTP graph in chained mode: the batch's first row carries the
+// real (token, h) inputs and each following row's inputs come from the previous
+// row's in-graph argmax and hidden state. One decode drafts n_tokens tokens.
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

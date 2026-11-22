@@ -315,6 +315,23 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+
+    // the adaptive floor defaults to 2 and parses explicitly
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_min_adaptive == 3);
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "5"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_min_adaptive == 5);
+
+    // the adaptive MTP type parses to the dedicated enum value
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive"};
+    common_params spec_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(std::find(spec_params.speculative.types.begin(), spec_params.speculative.types.end(),
+                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != spec_params.speculative.types.end());
+
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -344,6 +361,13 @@ static void test(void) {
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
 
+    printf("test-arg-parser: test draft context does not inherit --no-kv-offload\n\n");
+
+    params = common_params();
+    argv = {"binary_name", "-nkvo"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.no_kv_offload == true);
+    assert(common_base_params_to_speculative(params).no_kv_offload == false);
     {
         std::string ts_exact;
         for (size_t i = 0; i < llama_max_devices(); ++i) {
