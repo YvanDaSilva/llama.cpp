@@ -2093,6 +2093,33 @@ static std::optional<server_model_meta> resolve_child_for_conv(
     return std::nullopt;
 }
 
+// The context window a client may fill. The preset is the source of truth for a model
+// that is not loaded yet, which is the common case; a loaded instance is consulted next
+// and the trained window is only a last resort.
+static int64_t server_model_served_n_ctx(const server_model_meta & meta) {
+    std::string value;
+    if (meta.preset.get_option(COMMON_ARG_CTX_SIZE, value)) {
+        try {
+            const long long n_ctx = std::stoll(value);
+            if (n_ctx > 0) {
+                return n_ctx;
+            }
+        } catch (const std::exception &) {
+            // a malformed value falls through to the next source
+        }
+    }
+    if (meta.is_running() && meta.loaded_info.contains("meta")) {
+        const json & info = meta.loaded_info.at("meta");
+        if (info.is_object() && info.contains("n_ctx") && info.at("n_ctx").is_number_integer()) {
+            const int64_t n_ctx = info.at("n_ctx").get<int64_t>();
+            if (n_ctx > 0) {
+                return n_ctx;
+            }
+        }
+    }
+    return meta.n_ctx_train;
+}
+
 void server_models_routes::init_routes() {
     if (!common_subproc::is_supported()) {
         throw std::runtime_error("subprocess is not enabled on this build");
@@ -2261,7 +2288,12 @@ void server_models_routes::init_routes() {
             };
 
             if (meta.n_ctx_train > 0) {
-                model_info["context_length"] = meta.n_ctx_train;
+                model_info["max_context_length"] = meta.n_ctx_train;
+            }
+
+            const int64_t n_ctx_served = server_model_served_n_ctx(meta);
+            if (n_ctx_served > 0) {
+                model_info["context_length"] = n_ctx_served;
             }
 
             if (models.sched->memory_enabled()) {

@@ -1628,7 +1628,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.fit_params_min_ctx = UINT32_MAX;
             }
         }
-    ).set_env("LLAMA_ARG_CTX_SIZE"));
+    ).set_env(COMMON_ARG_CTX_SIZE));
     add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
