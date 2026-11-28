@@ -592,7 +592,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
             ggml_tensor * h_norm_b = build_norm(h_in, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
             ggml_tensor * e_norm_b = build_norm(tok_in, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
 
-            return build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm_b, h_norm_b, 0), layer.nextn.eh_proj_s);
+            return build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm_b, h_norm_b, 0));
         };
 
         // one MTP block over `width` projected rows starting at batch row `row0`;
@@ -605,7 +605,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
 
             cur_b = build_norm(cur_b, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
 
-            ggml_tensor * Qfull_b = build_lora_mm(layer.wq, cur_b, layer.wq_s);
+            ggml_tensor * Qfull_b = build_lora_mm(layer.wq, cur_b);
 
             ggml_tensor * Q_b = ggml_view_3d(ctx0, Qfull_b,
                     n_embd_head, n_head, width,
@@ -621,11 +621,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
                     ggml_element_size(Qfull_b) * n_embd_head);
             gate_b = ggml_cont_2d(ctx0, gate_b, n_embd_head * n_head, width);
 
-            ggml_tensor * K_b = build_lora_mm(layer.wk, cur_b, layer.wk_s);
+            ggml_tensor * K_b = build_lora_mm(layer.wk, cur_b);
             K_b = ggml_reshape_3d(ctx0, K_b, n_embd_head, n_head_kv, width);
             K_b = build_norm(K_b, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
 
-            ggml_tensor * V_b = build_lora_mm(layer.wv, cur_b, layer.wv_s);
+            ggml_tensor * V_b = build_lora_mm(layer.wv, cur_b);
             V_b = ggml_reshape_3d(ctx0, V_b, n_embd_head, n_head_kv, width);
 
             // M-RoPE positions are section-major: [dim0 x n_tokens, dim1 x n_tokens, ...]
@@ -663,7 +663,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
             cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, /*kv_rows*/ nullptr, nullptr, nullptr, 0, kq_scale_c, il);
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
-            cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
+            cur_b = build_lora_mm(layer.wo, cur_b);
 
             cur_b = ggml_add(ctx0, cur_b, inpSA_b);
 
@@ -671,9 +671,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
             cur_b = build_norm(cur_b, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
 
             cur_b = build_ffn(cur_b,
-                    layer.ffn_up,   nullptr, layer.ffn_up_s,
-                    layer.ffn_gate, nullptr, layer.ffn_gate_s,
-                    layer.ffn_down, nullptr, layer.ffn_down_s,
+                    layer.ffn_up,   nullptr,
+                    layer.ffn_gate, nullptr,
+                    layer.ffn_down, nullptr,
                     nullptr,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
 
@@ -715,7 +715,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
             ggml_tensor * h_next_j = build_norm(cur_j, head_norm_w2, nullptr, LLM_NORM_RMS, -1);
 
             ggml_tensor * head_w2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-            ggml_tensor * head_s2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
 
             // drafting rarely picks tokens outside the leading vocabulary range
             // (BPE ids correlate with frequency), so the chain can run a small
@@ -733,12 +732,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
             if (n_sub_env > 0 && n_sub_env < head_w2->ne[1]) {
                 ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w2,
                         head_w2->ne[0], n_sub_env, head_w2->nb[1], 0);
-                logits_j = ggml_mul_mat(ctx0, head_sub, h_next_j);
-                if (head_s2 != nullptr) {
-                    logits_j = ggml_mul(ctx0, logits_j, head_s2);
-                }
+                // the scale side-car rides on head_w2, build_lora_mm resolves it through the view
+                logits_j = build_lora_mm(head_sub, h_next_j);
             } else {
-                logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
+                logits_j = build_lora_mm(head_w2, h_next_j);
             }
 
             // the chain samples greedily in-graph; the host only needs the picked
